@@ -91,5 +91,6 @@
     "n_layers_q": 3,
     "use_spectral_norm": false,
     "gin_channels": 256
-  }
+  },
+  "version": "1.0.1"
 }
