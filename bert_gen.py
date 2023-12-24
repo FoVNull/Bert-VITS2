@@ -9,7 +9,8 @@ import torch.multiprocessing as mp
 from config import config
 
 
-def process_line(line):
+def process_line(x):
+    line, add_blank = x
     device = config.bert_gen_config.device
     if config.bert_gen_config.use_multi_device:
         rank = mp.current_process()._identity
@@ -26,12 +27,13 @@ def process_line(line):
     word2ph = [i for i in word2ph]
     phone, tone, language = cleaned_text_to_sequence(phone, tone, language_str)
 
-    phone = commons.intersperse(phone, 0)
-    tone = commons.intersperse(tone, 0)
-    language = commons.intersperse(language, 0)
-    for i in range(len(word2ph)):
-        word2ph[i] = word2ph[i] * 2
-    word2ph[0] += 1
+    if add_blank:
+        phone = commons.intersperse(phone, 0)
+        tone = commons.intersperse(tone, 0)
+        language = commons.intersperse(language, 0)
+        for i in range(len(word2ph)):
+            word2ph[i] = word2ph[i] * 2
+        word2ph[0] += 1
 
     bert_path = wav_path.replace(".WAV", ".wav").replace(".wav", ".bert.pt")
 
@@ -64,10 +66,16 @@ if __name__ == "__main__":
 
     with open(hps.data.validation_files, encoding="utf-8") as f:
         lines.extend(f.readlines())
+    add_blank = [hps.data.add_blank] * len(lines)
+
     if len(lines) != 0:
         num_processes = args.num_processes
         with Pool(processes=num_processes) as pool:
-            for _ in tqdm(pool.imap_unordered(process_line, lines), total=len(lines)):
-                pass
+            for _ in tqdm(
+                pool.imap_unordered(process_line, zip(lines, add_blank)),
+                total=len(lines),
+            ):
+                # 这里是缩进的代码块，表示循环体
+                pass  # 使用pass语句作为占位符
 
     print(f"bert生成完毕!, 共有{len(lines)}个bert.pt生成!")

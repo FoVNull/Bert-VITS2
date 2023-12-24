@@ -170,6 +170,7 @@ data/*
 !/default_config.yml
 /Web/
 /emotional/*/*.bin
+/slm/*/*.bin
 /bert/*/*.bin
 /bert/*/*.h5
 /bert/*/*.model
@@ -185,3 +186,5 @@ logs/
 Data/*
 
 configs/models/*.pth
+/onnx
+/.vs

@@ -5,11 +5,11 @@ import logging
 import gc
 import random
 
-from pydantic import BaseModel
+import librosa
 import gradio
 import numpy as np
 import utils
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query, Request, File, UploadFile, Form
 from fastapi.responses import Response, FileResponse
 from fastapi.staticfiles import StaticFiles
 from io import BytesIO
@@ -19,7 +19,7 @@ import torch
 import webbrowser
 import psutil
 import GPUtil
-from typing import Dict, Optional, List, Set
+from typing import Dict, Optional, List, Set, Union
 import os
 from tools.log import logger
 from urllib.parse import unquote
@@ -88,6 +88,16 @@ class Models:
         :param device: 模型推理使用设备
         :param language: 模型推理默认语言
         """
+        # 若文件不存在则不进行加载
+        if not os.path.isfile(model_path):
+            if model_path != "":
+                logger.warning(f"模型文件{model_path} 不存在，不进行初始化")
+            return self.num
+        if not os.path.isfile(config_path):
+            if config_path != "":
+                logger.warning(f"配置文件{config_path} 不存在，不进行初始化")
+            return self.num
+
         # 若路径中的模型已存在，则不添加模型，若不存在，则进行初始化。
         model_path = os.path.realpath(model_path)
         if model_path not in self.path2ids.keys():
@@ -149,17 +159,24 @@ if __name__ == "__main__":
     app = FastAPI()
     app.logger = logger
     # 挂载静态文件
+    logger.info("开始挂载网页页面")
     StaticDir: str = "./Web"
-    dirs = [fir.name for fir in os.scandir(StaticDir) if fir.is_dir()]
-    files = [fir.name for fir in os.scandir(StaticDir) if fir.is_dir()]
-    for dirName in dirs:
-        app.mount(
-            f"/{dirName}",
-            StaticFiles(directory=f"./{StaticDir}/{dirName}"),
-            name=dirName,
+    if not os.path.isdir(StaticDir):
+        logger.warning(
+            "缺少网页资源，无法开启网页页面，如有需要请在 https://github.com/jiangyuxiaoxiao/Bert-VITS2-UI 或者Bert-VITS对应版本的release页面下载"
         )
+    else:
+        dirs = [fir.name for fir in os.scandir(StaticDir) if fir.is_dir()]
+        files = [fir.name for fir in os.scandir(StaticDir) if fir.is_dir()]
+        for dirName in dirs:
+            app.mount(
+                f"/{dirName}",
+                StaticFiles(directory=f"./{StaticDir}/{dirName}"),
+                name=dirName,
+            )
     loaded_models = Models()
     # 加载模型
+    logger.info("开始加载模型")
     models_info = config.server_config.models
     for model_info in models_info:
         loaded_models.init_model(
@@ -173,49 +190,64 @@ if __name__ == "__main__":
     async def index():
         return FileResponse("./Web/index.html")
 
-    class Text(BaseModel):
-        text: str
-
-    @app.post("/voice")
-    def voice(
-        request: Request,  # fastapi自动注入
-        text: Text,
-        model_id: int = Query(..., description="模型ID"),  # 模型序号
-        speaker_name: str = Query(
-            None, description="说话人名"
-        ),  # speaker_name与 speaker_id二者选其一
-        speaker_id: int = Query(None, description="说话人id，与speaker_name二选一"),
-        sdp_ratio: float = Query(0.2, description="SDP/DP混合比"),
-        noise: float = Query(0.2, description="感情"),
-        noisew: float = Query(0.9, description="音素长度"),
-        length: float = Query(1, description="语速"),
-        language: str = Query(None, description="语言"),  # 若不指定使用语言则使用默认值
-        auto_translate: bool = Query(False, description="自动翻译"),
-        auto_split: bool = Query(False, description="自动切分"),
-    ):
-        """语音接口"""
-        text = text.text
-        logger.info(
-            f"{request.client.host}:{request.client.port}/voice  { unquote(str(request.query_params) )} text={text}"
-        )
+    async def _voice(
+        text: str,
+        model_id: int,
+        speaker_name: str,
+        speaker_id: int,
+        sdp_ratio: float,
+        noise: float,
+        noisew: float,
+        length: float,
+        language: str,
+        auto_translate: bool,
+        auto_split: bool,
+        emotion: Optional[Union[int, str]] = None,
+        reference_audio=None,
+        style_text: Optional[str] = None,
+        style_weight: float = 0.7,
+    ) -> Union[Response, Dict[str, any]]:
+        """TTS实现函数"""
         # 检查模型是否存在
         if model_id not in loaded_models.models.keys():
+            logger.error(f"/voice 请求错误：模型model_id={model_id}未加载")
             return {"status": 10, "detail": f"模型model_id={model_id}未加载"}
         # 检查是否提供speaker
         if speaker_name is None and speaker_id is None:
+            logger.error("/voice 请求错误：推理请求未提供speaker_name或speaker_id")
             return {"status": 11, "detail": "请提供speaker_name或speaker_id"}
         elif speaker_name is None:
             # 检查speaker_id是否存在
             if speaker_id not in loaded_models.models[model_id].id2spk.keys():
+                logger.error(f"/voice 请求错误：角色speaker_id={speaker_id}不存在")
                 return {"status": 12, "detail": f"角色speaker_id={speaker_id}不存在"}
             speaker_name = loaded_models.models[model_id].id2spk[speaker_id]
         # 检查speaker_name是否存在
         if speaker_name not in loaded_models.models[model_id].spk2id.keys():
+            logger.error(f"/voice 请求错误：角色speaker_name={speaker_name}不存在")
             return {"status": 13, "detail": f"角色speaker_name={speaker_name}不存在"}
+        # 未传入则使用默认语言
         if language is None:
             language = loaded_models.models[model_id].language
+        # 翻译会破坏mix结构，auto也会变得无意义。不要在这两个模式下使用
         if auto_translate:
+            if language == "auto" or language == "mix":
+                logger.error(
+                    f"/voice 请求错误：请勿同时使用language = {language}与auto_translate模式"
+                )
+                return {
+                    "status": 20,
+                    "detail": f"请勿同时使用language = {language}与auto_translate模式",
+                }
             text = trans.translate(Sentence=text, to_Language=language.lower())
+        if reference_audio is not None:
+            ref_audio = BytesIO(await reference_audio.read())
+            # 2.2 适配
+            if loaded_models.models[model_id].version == "2.2":
+                ref_audio, _ = librosa.load(ref_audio, 48000)
+
+        else:
+            ref_audio = reference_audio
         if not auto_split:
             with torch.no_grad():
                 audio = infer(
@@ -229,7 +261,12 @@ if __name__ == "__main__":
                     hps=loaded_models.models[model_id].hps,
                     net_g=loaded_models.models[model_id].net_g,
                     device=loaded_models.models[model_id].device,
+                    emotion=emotion,
+                    reference_audio=ref_audio,
+                    style_text=style_text,
+                    style_weight=style_weight,
                 )
+                audio = gradio.processing_utils.convert_to_16_bit_wav(audio)
         else:
             texts = cut_sent(text)
             audios = []
@@ -247,20 +284,67 @@ if __name__ == "__main__":
                             hps=loaded_models.models[model_id].hps,
                             net_g=loaded_models.models[model_id].net_g,
                             device=loaded_models.models[model_id].device,
+                            emotion=emotion,
+                            reference_audio=ref_audio,
+                            style_text=style_text,
+                            style_weight=style_weight,
                         )
                     )
-                audios.append(np.zeros((int)(44100 * 0.3)))
+                    audios.append(np.zeros(int(44100 * 0.2)))
                 audio = np.concatenate(audios)
                 audio = gradio.processing_utils.convert_to_16_bit_wav(audio)
-        wavContent = BytesIO()
-        wavfile.write(
-            wavContent, loaded_models.models[model_id].hps.data.sampling_rate, audio
+        with BytesIO() as wavContent:
+            wavfile.write(
+                wavContent, loaded_models.models[model_id].hps.data.sampling_rate, audio
+            )
+            response = Response(content=wavContent.getvalue(), media_type="audio/wav")
+            return response
+
+    @app.post("/voice")
+    async def voice(
+        request: Request,  # fastapi自动注入
+        text: str = Form(...),
+        model_id: int = Query(..., description="模型ID"),  # 模型序号
+        speaker_name: str = Query(
+            None, description="说话人名"
+        ),  # speaker_name与 speaker_id二者选其一
+        speaker_id: int = Query(None, description="说话人id，与speaker_name二选一"),
+        sdp_ratio: float = Query(0.2, description="SDP/DP混合比"),
+        noise: float = Query(0.2, description="感情"),
+        noisew: float = Query(0.9, description="音素长度"),
+        length: float = Query(1, description="语速"),
+        language: str = Query(None, description="语言"),  # 若不指定使用语言则使用默认值
+        auto_translate: bool = Query(False, description="自动翻译"),
+        auto_split: bool = Query(False, description="自动切分"),
+        emotion: Optional[Union[int, str]] = Query(None, description="emo"),
+        reference_audio: UploadFile = File(None),
+        style_text: Optional[str] = Form(None, description="风格文本"),
+        style_weight: float = Query(0.7, description="风格权重"),
+    ):
+        """语音接口，若需要上传参考音频请仅使用post请求"""
+        logger.info(
+            f"{request.client.host}:{request.client.port}/voice  { unquote(str(request.query_params) )} text={text}"
         )
-        response = Response(content=wavContent.getvalue(), media_type="audio/wav")
-        return response
+        return await _voice(
+            text=text,
+            model_id=model_id,
+            speaker_name=speaker_name,
+            speaker_id=speaker_id,
+            sdp_ratio=sdp_ratio,
+            noise=noise,
+            noisew=noisew,
+            length=length,
+            language=language,
+            auto_translate=auto_translate,
+            auto_split=auto_split,
+            emotion=emotion,
+            reference_audio=reference_audio,
+            style_text=style_text,
+            style_weight=style_weight,
+        )
 
     @app.get("/voice")
-    def voice(
+    async def voice(
         request: Request,  # fastapi自动注入
         text: str = Query(..., description="输入文字"),
         model_id: int = Query(..., description="模型ID"),  # 模型序号
@@ -275,71 +359,30 @@ if __name__ == "__main__":
         language: str = Query(None, description="语言"),  # 若不指定使用语言则使用默认值
         auto_translate: bool = Query(False, description="自动翻译"),
         auto_split: bool = Query(False, description="自动切分"),
+        emotion: Optional[Union[int, str]] = Query(None, description="emo"),
+        style_text: Optional[str] = Query(None, description="风格文本"),
+        style_weight: float = Query(0.7, description="风格权重"),
     ):
         """语音接口"""
         logger.info(
             f"{request.client.host}:{request.client.port}/voice  { unquote(str(request.query_params) )}"
         )
-        # 检查模型是否存在
-        if model_id not in loaded_models.models.keys():
-            return {"status": 10, "detail": f"模型model_id={model_id}未加载"}
-        # 检查是否提供speaker
-        if speaker_name is None and speaker_id is None:
-            return {"status": 11, "detail": "请提供speaker_name或speaker_id"}
-        elif speaker_name is None:
-            # 检查speaker_id是否存在
-            if speaker_id not in loaded_models.models[model_id].id2spk.keys():
-                return {"status": 12, "detail": f"角色speaker_id={speaker_id}不存在"}
-            speaker_name = loaded_models.models[model_id].id2spk[speaker_id]
-        # 检查speaker_name是否存在
-        if speaker_name not in loaded_models.models[model_id].spk2id.keys():
-            return {"status": 13, "detail": f"角色speaker_name={speaker_name}不存在"}
-        if language is None:
-            language = loaded_models.models[model_id].language
-        if auto_translate:
-            text = trans.translate(Sentence=text, to_Language=language.lower())
-        if not auto_split:
-            with torch.no_grad():
-                audio = infer(
-                    text=text,
-                    sdp_ratio=sdp_ratio,
-                    noise_scale=noise,
-                    noise_scale_w=noisew,
-                    length_scale=length,
-                    sid=speaker_name,
-                    language=language,
-                    hps=loaded_models.models[model_id].hps,
-                    net_g=loaded_models.models[model_id].net_g,
-                    device=loaded_models.models[model_id].device,
-                )
-        else:
-            texts = cut_sent(text)
-            audios = []
-            with torch.no_grad():
-                for t in texts:
-                    audios.append(
-                        infer(
-                            text=t,
-                            sdp_ratio=sdp_ratio,
-                            noise_scale=noise,
-                            noise_scale_w=noisew,
-                            length_scale=length,
-                            sid=speaker_name,
-                            language=language,
-                            hps=loaded_models.models[model_id].hps,
-                            net_g=loaded_models.models[model_id].net_g,
-                            device=loaded_models.models[model_id].device,
-                        )
-                    )
-                audios.append(np.zeros((int)(44100 * 0.3)))
-                audio = np.concatenate(audios)
-                audio = gradio.processing_utils.convert_to_16_bit_wav(audio)
-        wavContent = BytesIO()
-        wavfile.write(
-            wavContent, loaded_models.models[model_id].hps.data.sampling_rate, audio
+        return await _voice(
+            text=text,
+            model_id=model_id,
+            speaker_name=speaker_name,
+            speaker_id=speaker_id,
+            sdp_ratio=sdp_ratio,
+            noise=noise,
+            noisew=noisew,
+            length=length,
+            language=language,
+            auto_translate=auto_translate,
+            auto_split=auto_split,
+            emotion=emotion,
+            style_text=style_text,
+            style_weight=style_weight,
         )
-        response = Response(content=wavContent.getvalue(), media_type="audio/wav")
-        return response
 
     @app.get("/models/info")
     def get_loaded_models_info(request: Request):
@@ -360,7 +403,9 @@ if __name__ == "__main__":
         )
         result = loaded_models.del_model(model_id)
         if result is None:
+            logger.error(f"/models/delete 模型删除错误：模型{model_id}不存在，删除失败")
             return {"status": 14, "detail": f"模型{model_id}不存在，删除失败"}
+
         return {"status": 0, "detail": "删除成功"}
 
     @app.get("/models/add")
@@ -384,6 +429,7 @@ if __name__ == "__main__":
             elif os.path.isfile(os.path.join(model_dir, "../config.json")):
                 config_path = os.path.join(model_dir, "../config.json")
             else:
+                logger.error("/models/add 模型添加失败：未在模型所在目录以及上级目录找到config.json文件")
                 return {
                     "status": 15,
                     "detail": "查询未传入配置文件路径，同时默认路径./与../中不存在配置文件config.json。",
@@ -618,14 +664,17 @@ if __name__ == "__main__":
             f"{request.client.host}:{request.client.port}/tools/get_audio  { unquote(str(request.query_params) )}"
         )
         if not os.path.isfile(path):
+            logger.error(f"/tools/get_audio 获取音频错误：指定音频{path}不存在")
             return {"status": 18, "detail": "指定音频不存在"}
-        if not path.endswith(".wav"):
+        if not path.lower().endswith(".wav"):
+            logger.error(f"/tools/get_audio 获取音频错误：音频{path}非wav文件")
             return {"status": 19, "detail": "非wav格式文件"}
         return FileResponse(path=path)
 
     logger.warning("本地服务，请勿将服务端口暴露于外网")
     logger.info(f"api文档地址 http://127.0.0.1:{config.server_config.port}/docs")
-    webbrowser.open(f"http://127.0.0.1:{config.server_config.port}")
+    if os.path.isdir(StaticDir):
+        webbrowser.open(f"http://127.0.0.1:{config.server_config.port}")
     uvicorn.run(
         app, port=config.server_config.port, host="0.0.0.0", log_level="warning"
     )

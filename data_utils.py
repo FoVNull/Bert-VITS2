@@ -8,6 +8,7 @@ import commons
 from mel_processing import spectrogram_torch, mel_spectrogram_torch
 from utils import load_wav_to_torch, load_filepaths_and_text
 from text import cleaned_text_to_sequence
+from config import config
 
 """Multi speaker version"""
 
@@ -40,7 +41,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
 
         self.add_blank = hparams.add_blank
         self.min_text_len = getattr(hparams, "min_text_len", 1)
-        self.max_text_len = getattr(hparams, "max_text_len", 300)
+        self.max_text_len = getattr(hparams, "max_text_len", 384)
 
         random.seed(1234)
         random.shuffle(self.audiopaths_sid_text)
@@ -91,6 +92,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
 
         spec, wav = self.get_audio(audiopath)
         sid = torch.LongTensor([int(self.spk_map[sid])])
+
         return (phones, spec, wav, sid, tone, language, bert, ja_bert, en_bert)
 
     def get_audio(self, filename):
@@ -131,7 +133,8 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
                     center=False,
                 )
             spec = torch.squeeze(spec, 0)
-            torch.save(spec, spec_filename)
+            if config.train_ms_config.spec_cache:
+                torch.save(spec, spec_filename)
         return spec, audio_norm
 
     def get_text(self, text, word2ph, phone, tone, language_str, wav_path):
@@ -153,15 +156,15 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
 
         if language_str == "ZH":
             bert = bert_ori
-            ja_bert = torch.zeros(1024, len(phone))
-            en_bert = torch.zeros(1024, len(phone))
+            ja_bert = torch.randn(1024, len(phone))
+            en_bert = torch.randn(1024, len(phone))
         elif language_str == "JP":
-            bert = torch.zeros(1024, len(phone))
+            bert = torch.randn(1024, len(phone))
             ja_bert = bert_ori
-            en_bert = torch.zeros(1024, len(phone))
+            en_bert = torch.randn(1024, len(phone))
         elif language_str == "EN":
-            bert = torch.zeros(1024, len(phone))
-            ja_bert = torch.zeros(1024, len(phone))
+            bert = torch.randn(1024, len(phone))
+            ja_bert = torch.randn(1024, len(phone))
             en_bert = bert_ori
         phone = torch.LongTensor(phone)
         tone = torch.LongTensor(tone)
